@@ -5,12 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "qc"
 version = "0.1.0"
-description = "SSH-подключения, туннели-демон, быстрые команды и пароли — не выходя из терминала"
+description = "SSH connections, a tunnels daemon, quick commands and passwords — without leaving the terminal"
 requires-python = ">=3.11"
-dependencies = ["textual>=1.0"]
+dependencies = ["textual>=1.0", "pyrage>=1.2"]
 
 [project.scripts]
 qc = "qc.cli:main"
+qc-askpass = "qc.askpass:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

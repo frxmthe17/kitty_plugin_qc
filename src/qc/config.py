@@ -1,4 +1,4 @@
-"""Чтение данных из ~/qc (TOML) и проверка: конфликты портов, битые ссылки, ошибки формата."""
+"""Reading data from ~/qc (TOML) and checking it: port conflicts, broken references, format errors."""
 from __future__ import annotations
 
 import re
@@ -9,8 +9,8 @@ from pathlib import Path
 from qc import paths
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-# {{port}} — подстановка в быстрых командах; {{.Names}} (docker) и {{json .}} подстановкой не считаются
-PLACEHOLDER_RE = re.compile(r"\{\{([A-Za-zА-Яа-яЁё_][\w-]*)\}\}")
+# {{port}} is a placeholder in commands (any alphabet); {{.Names}} (docker) and {{json .}} are not placeholders
+PLACEHOLDER_RE = re.compile(r"\{\{([^\W\d][\w-]*)\}\}")
 
 
 @dataclass
@@ -21,10 +21,10 @@ class Host:
     port: int | None = None
     jump: str | None = None
     identity: str | None = None
-    password: str | None = None  # имя записи в хранилище, не сам пароль
+    password: str | None = None  # entry name in the password vault, not the password itself
     options: dict[str, str] = field(default_factory=dict)
     description: str = ""
-    group: str = ""
+    group: str = ""  # menu folder: "prod/eu"
     file: str = ""
 
     @property
@@ -46,7 +46,7 @@ class Tunnel:
     file: str = ""
 
     def spec_key(self) -> tuple:
-        """Что влияет на запущенный ssh — при изменении туннель перезапускается."""
+        """What affects the running ssh: when it changes, the tunnel is restarted."""
         return (self.via, self.local, self.remote, self.bind)
 
 
@@ -87,12 +87,27 @@ class Data:
     hosts: dict[str, Host] = field(default_factory=dict)
     tunnels: dict[str, Tunnel] = field(default_factory=dict)
     commands: dict[str, Command] = field(default_factory=dict)
-    issues: list[Issue] = field(default_factory=list)  # ошибки чтения файлов
+    issues: list[Issue] = field(default_factory=list)  # file read errors
 
 
 def _files(base: Path, sub: str) -> list[Path]:
+    """All *.toml files of a section, including subfolders (ssh/prod/eu.toml)."""
     d = base / sub
-    return sorted(d.glob("*.toml")) if d.is_dir() else []
+    return sorted(f for f in d.rglob("*.toml") if not any(x.startswith(".") for x in f.relative_to(d).parts)) \
+        if d.is_dir() else []
+
+
+def norm_dir(path: str) -> str:
+    """'/prod//eu/' → 'prod/eu'."""
+    return "/".join(x.strip() for x in str(path).split("/") if x.strip())
+
+
+def group_path(base: Path, sub: str, path: Path, doc: dict) -> str:
+    """Menu folder of an entry: the file's subfolders + group (or the file name). group = "prod/eu" means nested folders."""
+    rel = path.relative_to(base / sub)
+    parent = "/".join(rel.parts[:-1])
+    own = doc.get("group") or rel.stem
+    return norm_dir(f"{parent}/{own}")
 
 
 def _parse_remote(value) -> str | None:
@@ -114,15 +129,15 @@ def load(base: Path | None = None) -> Data:
             with path.open("rb") as f:
                 return tomllib.load(f)
         except (OSError, tomllib.TOMLDecodeError) as e:
-            data.issues.append(Issue("error", f"{path.relative_to(base)}: не читается — {e}"))
+            data.issues.append(Issue("error", f"{path.relative_to(base)}: cannot be read: {e}"))
             return None
 
     def add(kind: str, store: dict, name: str, obj, rel: str) -> None:
         if not NAME_RE.match(name):
-            data.issues.append(Issue("error", f"{rel}: имя «{name}» — только латиница, цифры, . _ -"))
+            data.issues.append(Issue("error", f"{rel}: name '{name}': only Latin letters, digits, . _ -"))
             return
         if name in store:
-            data.issues.append(Issue("error", f"{rel}: {kind} «{name}» уже есть в {store[name].file}"))
+            data.issues.append(Issue("error", f"{rel}: {kind} '{name}' already exists in {store[name].file}"))
             return
         store[name] = obj
 
@@ -130,10 +145,10 @@ def load(base: Path | None = None) -> Data:
         doc = read(path)
         if doc is None:
             continue
-        rel, group = str(path.relative_to(base)), doc.get("group", path.stem)
+        rel, group = str(path.relative_to(base)), group_path(base, "ssh", path, doc)
         for name, h in (doc.get("hosts") or {}).items():
             if not isinstance(h, dict) or not h.get("host"):
-                data.issues.append(Issue("error", f"{rel}: у сервера «{name}» нет поля host"))
+                data.issues.append(Issue("error", f"{rel}: server '{name}' has no host field"))
                 continue
             try:
                 obj = Host(
@@ -144,15 +159,15 @@ def load(base: Path | None = None) -> Data:
                     description=h.get("description", ""), group=group, file=rel,
                 )
             except (TypeError, ValueError) as e:
-                data.issues.append(Issue("error", f"{rel}: сервер «{name}» — {e}"))
+                data.issues.append(Issue("error", f"{rel}: server '{name}': {e}"))
                 continue
-            add("сервер", data.hosts, name, obj, rel)
+            add("server", data.hosts, name, obj, rel)
 
     for path in _files(base, "tunnels"):
         doc = read(path)
         if doc is None:
             continue
-        rel, group = str(path.relative_to(base)), doc.get("group", path.stem)
+        rel, group = str(path.relative_to(base)), group_path(base, "tunnels", path, doc)
         for name, t in (doc.get("tunnels") or {}).items():
             if not isinstance(t, dict):
                 continue
@@ -160,30 +175,30 @@ def load(base: Path | None = None) -> Data:
             local = t.get("local")
             if not t.get("via") or not isinstance(local, int) or remote is None:
                 data.issues.append(Issue(
-                    "error", f"{rel}: туннель «{name}» — нужны via, local (число) и remote (\"хост:порт\")"))
+                    "error", f"{rel}: tunnel '{name}' needs via, local (number) and remote (\"host:port\")"))
                 continue
             obj = Tunnel(
                 name=name, via=t["via"], local=local, remote=remote,
                 bind=t.get("bind", "127.0.0.1"), autostart=bool(t.get("autostart", False)),
                 description=t.get("description", ""), group=group, file=rel,
             )
-            add("туннель", data.tunnels, name, obj, rel)
+            add("tunnel", data.tunnels, name, obj, rel)
 
     for path in _files(base, "commands"):
         doc = read(path)
         if doc is None:
             continue
-        rel, group = str(path.relative_to(base)), doc.get("group", path.stem)
+        rel, group = str(path.relative_to(base)), group_path(base, "commands", path, doc)
         for name, c in (doc.get("commands") or {}).items():
             if not isinstance(c, dict) or not c.get("run"):
-                data.issues.append(Issue("error", f"{rel}: у команды «{name}» нет поля run"))
+                data.issues.append(Issue("error", f"{rel}: command '{name}' has no run field"))
                 continue
             obj = Command(
                 name=name, run=c["run"].strip(), title=c.get("title", ""),
                 tags=list(c.get("tags") or []), description=c.get("description", ""),
                 group=group, file=rel,
             )
-            add("команда", data.commands, name, obj, rel)
+            add("command", data.commands, name, obj, rel)
 
     return data
 
@@ -196,36 +211,45 @@ def unprivileged_port_start() -> int:
 
 
 def check(data: Data) -> list[Issue]:
-    """Проверка без сети: ссылки, циклы прыжков, порты."""
+    """Offline check: references, jump host loops, ports."""
     issues = list(data.issues)
 
     for h in data.hosts.values():
         if h.jump and h.jump not in data.hosts:
-            issues.append(Issue("error", f"сервер «{h.name}»: jump «{h.jump}» — нет такого сервера"))
+            issues.append(Issue("error", f"server '{h.name}': jump '{h.jump}': no such server"))
     for h in data.hosts.values():
         seen, cur = {h.name}, h
         while cur.jump and cur.jump in data.hosts:
             if cur.jump in seen:
-                issues.append(Issue("error", f"сервер «{h.name}»: прыжки по кругу ({' → '.join(seen)})"))
+                issues.append(Issue("error", f"server '{h.name}': jump host loop ({' → '.join(seen)})"))
                 break
             seen.add(cur.jump)
             cur = data.hosts[cur.jump]
+
+    from qc import vault
+
+    if vault.initialized():
+        have = set(vault.names())
+        for h in data.hosts.values():
+            if h.password and h.password not in have:
+                issues.append(Issue("warning", f"server '{h.name}': password '{h.password}' is not in the vault "
+                                               f"— add it in the Passwords tab or with qc pass add {h.password}"))
 
     low = unprivileged_port_start()
     by_port: dict[int, list[Tunnel]] = {}
     for t in data.tunnels.values():
         if t.via not in data.hosts:
-            issues.append(Issue("error", f"туннель «{t.name}»: via «{t.via}» — нет такого сервера"))
+            issues.append(Issue("error", f"tunnel '{t.name}': via '{t.via}': no such server"))
         if not (0 < t.local < 65536):
-            issues.append(Issue("error", f"туннель «{t.name}»: порт {t.local} вне диапазона"))
+            issues.append(Issue("error", f"tunnel '{t.name}': port {t.local} out of range"))
         elif t.local < low:
             issues.append(Issue(
-                "error", f"туннель «{t.name}»: порт {t.local} < {low} — без root не открыть, возьми порт повыше"))
+                "error", f"tunnel '{t.name}': port {t.local} < {low} cannot be opened without root, pick a higher port"))
         by_port.setdefault(t.local, []).append(t)
     for port, ts in sorted(by_port.items()):
         if len(ts) > 1:
-            names = ", ".join(f"«{t.name}»" for t in ts)
-            issues.append(Issue("warning", f"порт {port} у туннелей {names} — одновременно не запустить"))
+            names = ", ".join(f"'{t.name}'" for t in ts)
+            issues.append(Issue("warning", f"port {port} is used by tunnels {names}: they cannot run at the same time"))
     return issues
 
 
@@ -242,4 +266,4 @@ def suggest_free_port(data: Data, start: int) -> int:
         if p not in used and port_free("127.0.0.1", p):
             return p
         p += 1
-    raise RuntimeError("нет свободных портов")
+    raise RuntimeError("no free ports")

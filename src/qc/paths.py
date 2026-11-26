@@ -1,4 +1,4 @@
-"""Где что лежит. Всё переопределяется переменными окружения (нужно для тестов)."""
+"""Where things live. Everything can be overridden with environment variables (used by tests)."""
 import os
 from pathlib import Path
 
@@ -10,12 +10,12 @@ def _xdg(var: str, default: Path) -> Path:
 
 
 def data_dir() -> Path:
-    """Данные пользователя (git-репозиторий): ssh/ tunnels/ commands/ secure/."""
+    """User data (a git repo): ssh/ tunnels/ commands/ secure/."""
     return Path(os.environ.get("QC_HOME") or HOME / "qc").expanduser()
 
 
 def config_dir() -> Path:
-    """Настройки этого компьютера (не синхронизируются)."""
+    """Settings of this computer (not synced)."""
     return _xdg("XDG_CONFIG_HOME", HOME / ".config") / "qc"
 
 

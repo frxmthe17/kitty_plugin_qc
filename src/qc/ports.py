@@ -1,4 +1,4 @@
-"""Проверка локальных портов: свободен ли, кто занял, слушает ли кто-то."""
+"""Local port checks: is it free, who holds it, is anyone listening."""
 from __future__ import annotations
 
 import re
@@ -7,7 +7,7 @@ import subprocess
 
 
 def port_free(bind: str, port: int) -> bool:
-    """Самая честная проверка — попробовать занять порт самим."""
+    """The most reliable check: try to bind the port ourselves."""
     family = socket.AF_INET6 if ":" in bind else socket.AF_INET
     with socket.socket(family, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -33,21 +33,21 @@ def _listen_ports(path: str) -> set[int]:
 
 
 def listening(port: int) -> bool:
-    """Кто-то слушает порт (без подключения к нему — не шумим в логах postgres)."""
+    """Whether someone listens on the port (without connecting to it, so we do not spam the postgres logs)."""
     return port in _listen_ports("/proc/net/tcp") or port in _listen_ports("/proc/net/tcp6")
 
 
 def owner(port: int) -> str:
-    """Кто держит порт: «postgres (pid 123)» или «другой пользователь / docker»."""
+    """Who holds the port: 'postgres (pid 123)' or 'another user / docker'."""
     try:
         out = subprocess.run(
             ["ss", "-ltnpH", f"sport = :{port}"], capture_output=True, text=True, timeout=3
         ).stdout
     except (OSError, subprocess.TimeoutExpired):
-        return "неизвестно"
+        return "unknown"
     m = re.search(r'users:\(\("([^"]+)",pid=(\d+)', out)
     if m:
         return f"{m.group(1)} (pid {m.group(2)})"
     if out.strip():
-        return "процесс другого пользователя (docker / root)"
-    return "неизвестно"
+        return "a process of another user (docker / root)"
+    return "unknown"

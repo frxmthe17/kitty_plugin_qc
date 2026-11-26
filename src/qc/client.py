@@ -1,4 +1,4 @@
-"""Разговор с демоном qcd через unix-сокет."""
+"""Talking to the qcd daemon over the unix socket."""
 from __future__ import annotations
 
 import json
@@ -33,7 +33,7 @@ def request(cmd: str, timeout: float = 5, **kw) -> dict:
     finally:
         s.close()
     if not buf:
-        return {"ok": False, "error": "пустой ответ демона"}
+        return {"ok": False, "error": "empty response from the daemon"}
     return json.loads(buf)
 
 
@@ -45,7 +45,7 @@ def alive() -> bool:
 
 
 def ensure() -> None:
-    """Демон не отвечает — пробуем запустить службу systemd (если qc setup её ставил)."""
+    """The daemon does not respond — try starting the systemd service (if qc setup installed it)."""
     if alive():
         return
     if shutil.which("systemctl"):
@@ -55,4 +55,4 @@ def ensure() -> None:
             if alive():
                 return
             time.sleep(0.1)
-    raise DaemonDown("демон qcd не запущен — `qc setup` поставит службу, или запусти руками: qc daemon")
+    raise DaemonDown("daemon qcd is not running — `qc setup` installs the service, or start it by hand: qc daemon")

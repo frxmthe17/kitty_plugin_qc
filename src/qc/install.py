@@ -1,4 +1,4 @@
-"""qc setup / qc uninstall: службы systemd, Include в ~/.ssh/config, горячие клавиши bash и kitty."""
+"""qc setup / qc uninstall: systemd services, Include in ~/.ssh/config, bash and kitty hotkeys."""
 from __future__ import annotations
 
 import os
@@ -17,7 +17,7 @@ BASH_KEY = r"\C-g"
 
 
 def qc_command() -> list[str]:
-    """Как запускать qc из служб и kitty: путь к скрипту (симлинк pipx — переживёт `pipx upgrade`)."""
+    """How to run qc from services and kitty: the script path (the pipx symlink survives `pipx upgrade`)."""
     exe = shutil.which("qc")
     if exe:
         return [exe]
@@ -37,7 +37,7 @@ def _unit_files(schedule: str) -> dict[str, str]:
     return {
         "qcd.service": f"""\
 [Unit]
-Description=qc — демон SSH-туннелей
+Description=qc: SSH tunnels daemon
 After=network-online.target
 
 [Service]
@@ -50,7 +50,7 @@ WantedBy=default.target
 """,
         "qc-sync.service": f"""\
 [Unit]
-Description=qc — синхронизация ~/qc с гитом
+Description=qc: sync ~/qc with git
 After=network-online.target
 
 [Service]
@@ -59,7 +59,7 @@ ExecStart={qc} sync --notify
 """,
         "qc-sync.timer": f"""\
 [Unit]
-Description=qc — синхронизация ~/qc по расписанию
+Description=qc: scheduled sync of ~/qc
 
 [Timer]
 OnCalendar={calendar}
@@ -85,28 +85,28 @@ def install_units() -> list[str]:
         (d / name).write_text(text)
     _systemctl("daemon-reload")
     r = _systemctl("enable", "--now", "qcd.service")
-    out.append("служба qcd (туннели): " + ("запущена" if r.returncode == 0 else r.stderr.strip()))
-    _systemctl("restart", "qcd.service")  # подхватить новую версию программы
+    out.append("qcd service (tunnels): " + ("started" if r.returncode == 0 else r.stderr.strip()))
+    _systemctl("restart", "qcd.service")  # pick up the new program version
     out += apply_schedule(schedule)
     return out
 
 
 def apply_schedule(schedule: str) -> list[str]:
     if schedule not in settings.SCHEDULES:
-        raise ValueError(f"расписание: {', '.join(settings.SCHEDULES)}")
+        raise ValueError(f"schedule: {', '.join(settings.SCHEDULES)}")
     settings.set_value("sync.schedule", schedule)
     d = _units_dir()
     if not (d / "qc-sync.timer").exists():
-        return ["таймер синхронизации ещё не установлен — qc setup"]
+        return ["sync timer is not installed yet: run qc setup"]
     (d / "qc-sync.timer").write_text(_unit_files(schedule)["qc-sync.timer"])
     _systemctl("daemon-reload")
     if schedule == "off":
         _systemctl("disable", "--now", "qc-sync.timer")
-        return ["синхронизация по расписанию выключена"]
+        return ["scheduled sync is off"]
     r = _systemctl("enable", "--now", "qc-sync.timer")
     _systemctl("restart", "qc-sync.timer")
-    word = {"daily": "раз в день", "hourly": "раз в час"}[schedule]
-    return ["синхронизация " + word + ("" if r.returncode == 0 else f": {r.stderr.strip()}")]
+    word = {"daily": "daily", "hourly": "hourly"}[schedule]
+    return ["sync " + word + ("" if r.returncode == 0 else f": {r.stderr.strip()}")]
 
 
 def bashrc() -> Path:
@@ -115,11 +115,11 @@ def bashrc() -> Path:
 
 def install_bash() -> str:
     put_block(bashrc(), '[[ $- == *i* ]] && command -v qc >/dev/null && eval "$(qc shell-init bash)"')
-    return f"bash: меню по Ctrl+G (в новых вкладках; в текущей — source ~/.bashrc)"
+    return f"bash: menu on Ctrl+G (in new tabs; in the current one run source ~/.bashrc)"
 
 
 def shell_init_bash() -> str:
-    """Код для eval в .bashrc. Меню пишет выбор в файл, а функция вставляет его в строку ввода."""
+    """Code to eval in .bashrc. The menu writes the choice to a file, and the function inserts it into the prompt line."""
     return r'''__qc_menu() {
   local out
   out=$(mktemp "${XDG_RUNTIME_DIR:-/tmp}/qc-menu.XXXXXX") || return
@@ -141,7 +141,7 @@ def kitty_conf() -> Path:
 
 
 def kitty_key_taken() -> str | None:
-    """Занята ли клавиша в kitty.conf вне нашего блока."""
+    """Whether the key is already mapped in kitty.conf outside our block."""
     for line in text_outside_block(kitty_conf()).splitlines():
         parts = line.split()
         if len(parts) >= 2 and parts[0] == "map" and parts[1].lower() == KITTY_KEY:
@@ -149,16 +149,42 @@ def kitty_key_taken() -> str | None:
     return None
 
 
+def menu_size() -> tuple[int, int]:
+    """Menu window size, columns × lines (settings menu.size)."""
+    try:
+        c, r = str(settings.get("menu.size") or "").lower().replace("\u0445", "x").split("x")
+        return max(60, int(c)), max(15, int(r))
+    except ValueError:
+        return 110, 32
+
+
+def popup_opts() -> list[str]:
+    """Options of the floating kitty panel: centered, above all windows, with exclusive keyboard focus."""
+    cols, lines = menu_size()
+    return [f"edge=center-sized", f"columns={cols}", f"lines={lines}", "layer=overlay",
+            "focus-policy=exclusive"]
+
+
+def popup_available() -> bool:
+    """Whether the menu can open as a separate centered window: kitty is installed and there is a graphical session."""
+    return bool(shutil.which("kitten") and (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")))
+
+
 def install_kitty() -> str:
     taken = kitty_key_taken()
     if taken:
-        return f"kitty: {KITTY_KEY} уже занят в kitty.conf ({taken}) — блок qc не добавлен"
+        return f"kitty: {KITTY_KEY} is already mapped in kitty.conf ({taken}); qc block not added"
     qc = " ".join(shlex.quote(p) for p in qc_command())
-    # Меню — поверх текущего окна; @active-kitty-window-id kitty подставит сам: туда вставляется команда.
-    # --allow-remote-control даёт меню право открыть вкладку с ssh и вставить текст.
-    put_block(kitty_conf(), f"map {KITTY_KEY} launch --type=overlay --allow-remote-control "
-                            f"{qc} menu --kitty @active-kitty-window-id")
-    return f"kitty: меню по Ctrl+Shift+M (подхватится после перезапуска kitty или Ctrl+Shift+F5)"
+    # The menu opens as a centered window (a panel of the same kitty) or over the current window (menu.window = full/inline).
+    # kitty fills in @active-kitty-window-id itself: the command is inserted there, and the ssh tab opens next to it.
+    # --allow-remote-control lets the menu open an ssh tab and insert text.
+    if (settings.get("menu.window") or "popup") == "popup":
+        how = "--type=os-panel " + " ".join(f"--os-panel {o}" for o in popup_opts())
+    else:
+        how = "--type=overlay"
+    put_block(kitty_conf(), f"map {KITTY_KEY} launch {how} --allow-remote-control "
+                            f"{qc} menu --kitty @active-kitty-window-id --in-popup")
+    return f"kitty: menu on Ctrl+Shift+M (takes effect after restarting kitty or Ctrl+Shift+F5)"
 
 
 def setup(remote: str | None) -> list[str]:
@@ -166,17 +192,17 @@ def setup(remote: str | None) -> list[str]:
 
     out = []
     if remote:
-        out.append("данные: " + sync.attach(remote))
+        out.append("data: " + sync.attach(remote))
     elif not sync.is_repo():
         sync.init_local()
-        out.append(f"данные: заведена {paths.data_dir()} (адрес гита — потом в меню «Настройки»)")
+        out.append(f"data: created {paths.data_dir()} (set the git URL later in the 'Settings' menu)")
     else:
-        out.append(f"данные: {paths.data_dir()} на месте")
+        out.append(f"data: {paths.data_dir()} already exists")
     from qc import config
 
     sshgen.write(config.load())
     sshgen.install_include()
-    out.append(f"ssh: Include в {sshgen.user_ssh_config()} — `ssh <имя>` работает и без меню")
+    out.append(f"ssh: Include in {sshgen.user_ssh_config()}, so `ssh <name>` works without the menu too")
     out.append(install_bash())
     out.append(install_kitty())
     out += install_units()
@@ -190,11 +216,11 @@ def uninstall() -> list[str]:
     for name in ("qcd.service", "qc-sync.service", "qc-sync.timer"):
         (_units_dir() / name).unlink(missing_ok=True)
     _systemctl("daemon-reload")
-    out.append("службы qcd и qc-sync убраны (туннели остановлены)")
+    out.append("qcd and qc-sync services removed (tunnels stopped)")
     for path in (sshgen.user_ssh_config(), bashrc(), kitty_conf()):
         if remove_block(path):
-            out.append(f"убран блок qc из {path}")
-    out.append(f"данные {paths.data_dir()} и настройки {paths.config_dir()} не тронуты")
+            out.append(f"removed the qc block from {path}")
+    out.append(f"data {paths.data_dir()} and settings {paths.config_dir()} left untouched")
     return out
 
 

@@ -1,4 +1,4 @@
-"""Настройки этого компьютера: ~/.config/qc/settings.toml (в репозиторий данных не попадают)."""
+"""Settings of this computer: ~/.config/qc/settings.toml (not part of the data repository)."""
 from __future__ import annotations
 
 import tomllib
@@ -7,7 +7,13 @@ from qc import paths
 
 DEFAULTS: dict[str, dict] = {
     "sync": {"remote": "", "schedule": "daily"},  # daily | hourly | off
+    # menu: popup is a window centered on screen above everything (kitty panel), inline is below the prompt, full is the whole terminal
+    "menu": {"window": "popup", "size": "110x32"},
+    # the daemon locks the password vault after this many hours (0 — only by hand or when it stops);
+    # a copied password is cleared from the clipboard after clipboard_seconds
+    "vault": {"timeout_hours": 8, "clipboard_seconds": 30},
 }
+WINDOWS = ("popup", "inline", "full")
 SCHEDULES = ("daily", "hourly", "off")
 
 
@@ -36,7 +42,7 @@ def _toml_value(v) -> str:
 
 
 def save(s: dict) -> None:
-    lines = ["# Настройки qc на этом компьютере. Меняются через меню «Настройки» или `qc config`.", ""]
+    lines = ["# qc settings on this computer. Change them via the 'Settings' menu or `qc config`.", ""]
     for section, values in s.items():
         lines.append(f"[{section}]")
         lines += [f"{k} = {_toml_value(v)}" for k, v in values.items()]
@@ -54,7 +60,7 @@ def get(key: str):
 def set_value(key: str, value) -> None:
     section, _, name = key.partition(".")
     if not name:
-        raise ValueError("ключ вида раздел.имя, например sync.remote")
+        raise ValueError("key must be section.name, e.g. sync.remote")
     s = load()
     s.setdefault(section, {})[name] = value
     save(s)

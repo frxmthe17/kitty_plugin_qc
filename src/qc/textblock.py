@@ -1,5 +1,5 @@
-"""Помеченные блоки «# >>> qc >>> … # <<< qc <<<» в чужих файлах (.bashrc, ~/.ssh/config, kitty.conf).
-qc правит только внутри своего блока; `qc uninstall` убирает блок целиком."""
+"""Marked blocks '# >>> qc >>> … # <<< qc <<<' in files qc does not own (.bashrc, ~/.ssh/config, kitty.conf).
+qc edits only inside its own block; `qc uninstall` removes the whole block."""
 from __future__ import annotations
 
 from pathlib import Path
