@@ -1,0 +1,76 @@
+"""Генерация ~/qc/.generated/ssh_config и подключение его в ~/.ssh/config."""
+from __future__ import annotations
+
+import os
+import re
+from pathlib import Path
+
+from qc import paths
+from qc.config import Data
+from qc.textblock import has_block, put_block
+
+_SAFE = re.compile(r"^[A-Za-z0-9._@%:/~+=,-]+$")
+
+
+def _q(value: str) -> str:
+    """Значения с # и пробелами — в кавычках (логин бастиона «880…#10.1.56.37»)."""
+    return value if _SAFE.match(value) else '"' + value.replace('"', '\\"') + '"'
+
+
+def render(data: Data) -> str:
+    lines = [
+        "# Собрано qc из ~/qc/ssh/*.toml — руками не править, правки пропадут.",
+        "",
+    ]
+    group = None
+    for h in sorted(data.hosts.values(), key=lambda h: (h.group, h.name)):
+        if h.group != group:
+            group = h.group
+            lines.append(f"# ===== {group} =====")
+        if h.description:
+            lines.append(f"# {h.description}")
+        lines.append(f"Host {h.name}")
+        lines.append(f"    HostName {_q(h.host)}")
+        if h.user:
+            lines.append(f"    User {_q(h.user)}")
+        if h.port:
+            lines.append(f"    Port {h.port}")
+        if h.jump:
+            lines.append(f"    ProxyJump {h.jump}")
+        if h.identity:
+            lines.append(f"    IdentityFile {_q(h.identity)}")
+        for k, v in h.options.items():
+            lines.append(f"    {k} {_q(v)}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def write(data: Data) -> Path:
+    path = paths.generated_ssh_config()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(render(data))
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+    return path
+
+
+def user_ssh_config() -> Path:
+    return Path(os.environ.get("QC_USER_SSH_CONFIG") or paths.HOME / ".ssh" / "config")
+
+
+def include_installed() -> bool:
+    return has_block(user_ssh_config())
+
+
+def install_include() -> None:
+    """Include должен стоять в начале файла — до любых Host, иначе попадёт внутрь чужого блока."""
+    cfg = user_ssh_config()
+    cfg.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    put_block(cfg, f"Include {paths.generated_ssh_config()}", top=True)
+    os.chmod(cfg, 0o600)
+
+
+def config_args() -> list[str]:
+    """Include стоит — обычный ssh видит наши серверы. Нет — даём файл явно (ProxyJump тоже его получит)."""
+    return [] if include_installed() else ["-F", str(paths.generated_ssh_config())]
