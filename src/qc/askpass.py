@@ -19,14 +19,16 @@ def program() -> str:
     return shutil.which("qc-askpass") or "qc-askpass"
 
 
-def env(chain: list[str], token: str) -> dict[str, str]:
-    """Environment for an ssh process that should take passwords from the vault."""
+def env(chain: list[str], token: str, tunnel: str = "") -> dict[str, str]:
+    """Environment for an ssh process that takes passwords from the vault — or, for a tunnel,
+    from the user through the menu when the vault has none."""
     e = dict(os.environ)
     e.update({
         "SSH_ASKPASS": program(),
         "SSH_ASKPASS_REQUIRE": "force",
         "QC_ASKPASS_CHAIN": ",".join(chain),
         "QC_ASKPASS_TOKEN": token,
+        "QC_ASKPASS_TUNNEL": tunnel,
     })
     return e
 
@@ -35,12 +37,14 @@ def main() -> None:
     from qc import client, vault
 
     prompt = " ".join(sys.argv[1:])
-    if vault.parse_prompt(prompt) is None:
+    tunnel = os.environ.get("QC_ASKPASS_TUNNEL", "")
+    if not tunnel and vault.parse_prompt(prompt) is None:
         sys.exit(1)
     try:
-        r = client.request("askpass", timeout=10, prompt=prompt,
+        # a tunnel may wait for the user to type the password in the menu — up to ~100 s
+        r = client.request("askpass", timeout=130 if tunnel else 10, prompt=prompt,
                            chain=[c for c in os.environ.get("QC_ASKPASS_CHAIN", "").split(",") if c],
-                           token=os.environ.get("QC_ASKPASS_TOKEN", ""))
+                           token=os.environ.get("QC_ASKPASS_TOKEN", ""), tunnel=tunnel)
     except (client.DaemonDown, OSError, ValueError) as e:
         print(f"qc-askpass: {e}", file=sys.stderr)
         sys.exit(1)

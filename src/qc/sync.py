@@ -50,6 +50,8 @@ jump = "bastion"          # = ssh -J
 [tunnels.db-pg]
 via = "db"                # server from ssh/
 local = 15432             # port on this computer
+# bind = "127.0.0.2"      # local address, 127.0.0.1 by default: the same port can run on 127.0.0.2,
+                          # 127.0.0.3… at once; 0.0.0.0 opens it to the whole network
 remote = "127.0.0.1:5432" # where to on the other side
 autostart = false         # bring up at login
 

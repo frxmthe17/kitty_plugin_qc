@@ -1,6 +1,7 @@
 """Reading data from ~/qc (TOML) and checking it: port conflicts, broken references, format errors."""
 from __future__ import annotations
 
+import ipaddress
 import re
 import tomllib
 from dataclasses import dataclass, field
@@ -235,9 +236,16 @@ def check(data: Data) -> list[Issue]:
                 issues.append(Issue("warning", f"server '{h.name}': password '{h.password}' is not in the vault "
                                                f"— add it in the Passwords tab or with qc pass add {h.password}"))
 
+    from qc import ports
+
     low = unprivileged_port_start()
     by_port: dict[int, list[Tunnel]] = {}
     for t in data.tunnels.values():
+        try:
+            ipaddress.ip_address(ports.norm_bind(t.bind))
+        except ValueError:
+            issues.append(Issue("error", f"tunnel '{t.name}': bind '{t.bind}' is not an IP address "
+                                         "(127.0.0.1, 127.0.0.2, 0.0.0.0…)"))
         if t.via not in data.hosts:
             issues.append(Issue("error", f"tunnel '{t.name}': via '{t.via}': no such server"))
         if not (0 < t.local < 65536):
@@ -247,9 +255,13 @@ def check(data: Data) -> list[Issue]:
                 "error", f"tunnel '{t.name}': port {t.local} < {low} cannot be opened without root, pick a higher port"))
         by_port.setdefault(t.local, []).append(t)
     for port, ts in sorted(by_port.items()):
-        if len(ts) > 1:
-            names = ", ".join(f"'{t.name}'" for t in ts)
-            issues.append(Issue("warning", f"port {port} is used by tunnels {names}: they cannot run at the same time"))
+        # the same port is fine on different addresses (127.0.0.2:443 and 127.0.0.3:443), 0.0.0.0 takes them all
+        for i, a in enumerate(ts):
+            for b in ts[i + 1:]:
+                if ports.overlap(a.bind, b.bind):
+                    where = ports.endpoint(a.bind if not ports.is_wildcard(b.bind) else b.bind, port)
+                    issues.append(Issue("warning", f"{where} is used by tunnels '{a.name}' and '{b.name}': "
+                                                   "they cannot run at the same time"))
     return issues
 
 

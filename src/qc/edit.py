@@ -25,6 +25,8 @@ description = ""
 [tunnels.{name}]
 via = ""                  # server from ssh/
 local = 15432             # port on this computer
+# bind = "127.0.0.2"      # local address, 127.0.0.1 by default: the same port can run on 127.0.0.2,
+                          # 127.0.0.3… at once; 0.0.0.0 opens it to the whole network
 remote = "127.0.0.1:5432" # where to connect on the remote side
 autostart = false
 description = ""
@@ -245,3 +247,25 @@ def snapshot(files: list[Path]) -> dict[Path, float]:
         except OSError:
             out[f] = 0
     return out
+
+
+def remember_password(data: config.Data, server: str, entry: str, secret: str) -> str:
+    """Save a typed password in the vault; if the server has no `password = …` yet, add that line under
+    its [hosts.<name>] header (the rest of the file, comments included, stays as it is). Returns what was done."""
+    from qc import vault
+
+    vault.put(entry, secret)
+    done = f"password '{entry}' saved"
+    h = data.hosts.get(server)
+    if h and not h.password:
+        path = paths.data_dir() / h.file
+        line = entry_line(path, "hosts", server)
+        if line:
+            lines = path.read_text().splitlines(keepends=True)
+            lines.insert(line, f"password = {toml_str(entry)}\n")
+            path.write_text("".join(lines))
+            done += f", server '{server}' now refers to it ({h.file})"
+        else:
+            done += f"; add password = \"{entry}\" to server '{server}' by hand"
+    vault.commit(f"qc: password {entry} saved")
+    return done

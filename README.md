@@ -43,6 +43,13 @@ in the command line or the shell history. A saved password that the server rejec
 (fail2ban). Menu: the Passwords tab — Enter copies (the clipboard is cleared after 30 s), Ctrl+T types it
 into the kitty window, Ctrl+N / Ctrl+E / Ctrl+D — new / change / delete, Ctrl+L — lock.
 
+Tunnels ask like a browser: if ssh needs a password that is not saved (or the saved one is rejected),
+the tunnel waits and the menu (or `qc t up`) shows a password field — one per server on the way, jump hosts
+included, up to 3 tries. When the tunnel is up, qc asks whether to save each typed password; for a server
+without `password = …` it adds that line to its `ssh/*.toml`. Typed passwords that are not saved live only
+in the daemon's memory until the tunnel is stopped (so it can reconnect). One-time codes are asked the same
+way and never kept.
+
 Note: the KDE clipboard history (Klipper) may still remember a copied password; Ctrl+T in kitty does not touch the clipboard.
 
 ## Commands

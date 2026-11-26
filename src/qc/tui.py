@@ -17,14 +17,14 @@ from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Input, Label, Static, TabbedContent, TabPane
 
-from qc import client, clipboard, config, edit, install, paths, settings, sync, vault
+from qc import client, clipboard, config, edit, install, paths, ports, settings, sync, vault
 
 TABS = ["ssh", "tun", "cmd", "pass", "set"]
 TREE_TABS = ("ssh", "tun", "cmd")  # folder-based tabs; passwords and settings are flat lists
 UP = ".."
 TUN_ICONS = {"running": ("●", "green"), "starting": ("◐", "yellow"), "retry": ("↻", "yellow"),
-             "error": ("✗", "red"), "stopped": ("○", "dim")}
-ACTIVE = ("running", "starting", "retry")
+             "error": ("✗", "red"), "stopped": ("○", "dim"), "password": ("?", "yellow")}
+ACTIVE = ("running", "starting", "retry", "password")
 
 
 def is_dir(key: str | None) -> bool:
@@ -185,6 +185,8 @@ class QcApp(App[tuple | None]):
         self.select_next: dict[str, str] = {}  # where to put the cursor after changing folder
         self.syncing = False
         self.vault_info: dict = {}  # from the daemon: initialized, unlocked, lock_at
+        self.prompted: set[tuple] = set()  # (tunnel, ask time) — password questions already shown
+        self.saving: set[str] = set()  # tunnels whose "save the password?" questions are on screen
 
     # ---------- layout ----------
 
@@ -335,6 +337,9 @@ class QcApp(App[tuple | None]):
                 state = "running" + (f" since {time.strftime('%H:%M', time.localtime(t['since']))}" if t["since"] else "")
             elif t["state"] == "starting":
                 state = "connecting…"
+            elif t["state"] == "password" and t.get("ask"):
+                a = t["ask"]
+                state = ("wrong password — " if a["failed"] else "") + f"password for {a['login']}? Enter to type it"
             elif t["state"] == "retry":
                 left = max(0, int((t["retry_at"] or 0) - time.time()))
                 state = f"{t['error']} — retry in {left}s"
@@ -343,7 +348,8 @@ class QcApp(App[tuple | None]):
             else:
                 state = "stopped" + (" (autostart)" if t["autostart"] else "")
             rows.append((t["name"], (Text(icon, style=color), Text(self.rel_name("tun", x), style="bold"),
-                                     str(t["local"]), f"{t['via']} → {t['remote']}", Text(state, style=color))))
+                                     ports.short(t.get("bind"), t["local"]), f"{t['via']} → {t['remote']}",
+                                     Text(state, style=color))))
         self.set_path("tun")
         self.fill("tun", rows)
 
@@ -456,6 +462,7 @@ class QcApp(App[tuple | None]):
     def _set_tunnels(self, tunnels: list[dict], err: str, vinfo: dict | None = None) -> None:
         self.tunnels, self.daemon_error = tunnels, err
         self.render_tun()
+        self.tunnel_questions()
         if vinfo is not None and vinfo != self.vault_info:
             self.vault_info = vinfo
             self.render_pass()
@@ -586,7 +593,9 @@ class QcApp(App[tuple | None]):
             self.connect(key)
         elif tab == "tun":
             t = next((t for t in self.tunnels if t["name"] == key), None)
-            if t:
+            if t and t["state"] == "password" and t.get("ask"):
+                self.prompt_password(t)
+            elif t:
                 cmd = "down" if t["state"] in ("running", "starting", "retry") else "up"
                 self.tunnel_cmd(cmd, key)
         elif tab == "cmd":
@@ -631,6 +640,81 @@ class QcApp(App[tuple | None]):
         if len(names) > 1:
             self.notify(("stopping: " if cmd == "down" else "starting: ") + ", ".join(names), title="tunnels")
         self.tunnel_cmd(cmd, *names)
+
+    # ---------- typed passwords (browser-style) ----------
+
+    def tunnel_questions(self) -> None:
+        """A tunnel waits for a password → ask it; a typed password worked → offer to save it."""
+        if len(self.screen_stack) > 1:  # a dialog is open — ask after it
+            return
+        for t in self.tunnels:
+            ask = t.get("ask")
+            if t["state"] == "password" and ask and (t["name"], ask["since"]) not in self.prompted:
+                self.prompt_password(t)
+                return
+            if t.get("unsaved") and t["name"] not in self.saving:
+                self.saving.add(t["name"])
+                self.take_unsaved(t["name"])
+                return
+
+    def prompt_password(self, t: dict) -> None:
+        ask = t["ask"]
+        self.prompted.add((t["name"], ask["since"]))
+        title = (f"Tunnel {t['name']}: " + ("wrong password, try again. " if ask["failed"] else "")
+                 + (f"Password for {ask['login']}" if "@" in ask["login"] else ask["login"]))
+        self.push_screen(AskScreen(title, password=True, placeholder="Esc — cancel the connection"),
+                         lambda v: self.send_password(t["name"], v))
+
+    @work(thread=True, group="tunpw")
+    def send_password(self, name: str, value: str | None) -> None:
+        try:
+            if value:
+                client.request("password", tunnel=name, secret=value)
+            else:
+                client.request("password", tunnel=name, cancel=True)
+        except client.DaemonDown as e:
+            self.call_from_thread(self.notify, str(e), severity="error")
+        self.poll_tunnels()
+
+    @work(thread=True, group="tunpw")
+    def take_unsaved(self, name: str) -> None:
+        try:
+            items = client.request("take_unsaved", tunnel=name).get("items", [])
+        except client.DaemonDown:
+            items = []
+        self.call_from_thread(self.ask_save, name, [i for i in items if i.get("server")])
+
+    def ask_save(self, name: str, items: list[dict], i: int = 0) -> None:
+        """One question per typed password: save it (or update the saved one)?"""
+        if i >= len(items):
+            self.saving.discard(name)
+            return
+        it = items[i]
+        server = it["server"]
+        refers = self.data.hosts.get(server) and self.data.hosts[server].password
+        text = (f"It is stored encrypted in ~/qc/secure as '{it['entry']}'"
+                + ("." if refers else f", and server '{server}' will refer to it (password = \"{it['entry']}\")."))
+
+        def save_then_next() -> None:
+            try:
+                msg = edit.remember_password(self.data, server, it["entry"], it["secret"])
+                self.notify(msg, title="password vault")
+            except vault.VaultError as e:
+                self.notify(str(e), severity="error")
+            self.load_data()
+            self.ask_save(name, items, i + 1)
+
+        def answered(yes: bool | None) -> None:
+            if not yes:
+                self.ask_save(name, items, i + 1)
+            elif vault.initialized():
+                save_then_next()
+            else:
+                self.vault_init(save_then_next)
+
+        verb = "Update the saved password" if it["update"] else "Save the password"
+        self.push_screen(ConfirmScreen(f"{verb} for {it['login']} ({server})?", text,
+                                       "Enter — save, Esc — not now"), answered)
 
     @work(thread=True, group="tuncmd")
     def tunnel_cmd(self, cmd: str, *names: str) -> None:

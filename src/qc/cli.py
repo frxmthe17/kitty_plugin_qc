@@ -13,7 +13,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from qc import askpass, client, config, install, paths, settings, sshgen, sync, vault
+from qc import askpass, client, config, install, paths, ports, settings, sshgen, sync, vault
 
 
 def die(msg: str, code: int = 1) -> None:
@@ -184,7 +184,7 @@ def do_lock(lock: bool) -> None:
 
 # ---------- tunnels ----------
 
-ICON = {"running": "●", "starting": "◐", "retry": "↻", "error": "✗", "stopped": "○"}
+ICON = {"running": "●", "starting": "◐", "retry": "↻", "error": "✗", "stopped": "○", "password": "?"}
 
 
 def print_tunnels(resp: dict) -> None:
@@ -194,16 +194,59 @@ def print_tunnels(resp: dict) -> None:
     w = max([len(t["name"]) for t in ts] + [4])
     for t in ts:
         state = {"running": "running", "starting": "connecting…", "stopped": "stopped"}.get(t["state"], "")
+        if t["state"] == "password" and t.get("ask"):
+            state = f"waiting for the password for {t['ask']['login']}"
         if t["state"] == "retry":
             state = f"{t['error']}: retry in {max(0, int(t['retry_at'] - time.time()))} s"
         elif t["state"] == "error":
             state = t["error"]
         auto = " [auto]" if t["autostart"] else ""
-        print(f"{ICON.get(t['state'], '?')} {t['name']:<{w}}  {t['local']:>5} → {t['via']}:{t['remote']}"
+        print(f"{ICON.get(t['state'], '?')} {t['name']:<{w}}  {ports.short(t.get('bind'), t['local']):>5} → {t['via']}:{t['remote']}"
               f"  {state}{auto}")
     for i in resp.get("issues", []):
         if i["level"] == "warning" or re.search(r"\b(tunnel|port)\b", i["text"]):
             print(config.Issue(i["level"], i["text"]))
+
+
+def type_password(t: dict) -> None:
+    """The tunnel waits for a password that is not saved anywhere: type it here."""
+    ask = t["ask"]
+    label = f"password for {ask['login']}" if "@" in ask["login"] else ask["login"]
+    try:
+        value = getpass.getpass(f"{t['name']}: " + ("wrong password, try again. " if ask["failed"] else "")
+                                + f"{label}: ") if sys.stdin.isatty() else ""
+    except (EOFError, KeyboardInterrupt):
+        print(file=sys.stderr)
+        value = ""
+    if value:
+        client.request("password", tunnel=t["name"], secret=value)
+    else:
+        client.request("password", tunnel=t["name"], cancel=True)
+
+
+def offer_save(items: list[dict]) -> None:
+    """Typed passwords that worked: save them in the vault?"""
+    from qc import edit
+
+    data = config.load()
+    for it in items:
+        if not it.get("server") or not sys.stdin.isatty():
+            continue
+        verb = "Update the saved password" if it["update"] else "Save the password"
+        try:
+            ans = input(f"{verb} for {it['login']} ({it['server']}) in the vault as '{it['entry']}'? [Y/n] ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if ans.strip().lower() in ("n", "no"):
+            continue
+        try:
+            if not vault.initialized():
+                print("qc: no password vault yet — creating it")
+                vault.init(ask_new("new master password"))
+            print("✓ " + edit.remember_password(data, it["server"], it["entry"], it["secret"]))
+        except vault.VaultError as e:
+            print(f"qc: {e}", file=sys.stderr)
 
 
 def do_tunnels(args) -> None:
@@ -227,16 +270,26 @@ def do_tunnels(args) -> None:
         if not r.get("ok"):
             die(r.get("error", "error"))
         if args.action in ("up", "restart"):
-            # wait for the result (running or error), but no longer than 20 s
+            # wait for the result (running or error), but no longer than 20 s; a password question pauses the clock
             names, deadline = set(r["names"]), time.time() + 20
+            asked: set[tuple] = set()
             time.sleep(0.3)
             while time.time() < deadline:
                 st = client.request("status")
                 mine = [t for t in st["tunnels"] if t["name"] in names]
+                for t in mine:
+                    ask = t.get("ask")
+                    if t["state"] == "password" and ask and (t["name"], ask["since"]) not in asked:
+                        asked.add((t["name"], ask["since"]))
+                        type_password(t)
+                        deadline = time.time() + 20
                 if all(t["state"] in ("running", "error", "retry", "stopped") for t in mine):
                     break
                 time.sleep(0.3)
             print_tunnels({"tunnels": mine})
+            for t in mine:
+                if t.get("unsaved"):
+                    offer_save(client.request("take_unsaved", tunnel=t["name"]).get("items", []))
         else:
             print("stopped: " + ", ".join(r["names"]))
     except client.DaemonDown as e:
@@ -252,16 +305,17 @@ def do_check() -> int:
     print(f"servers {len(data.hosts)}, tunnels {len(data.tunnels)}, commands {len(data.commands)}")
     running = set()
     try:
-        running = {t["local"] for t in client.request("status", timeout=2).get("tunnels", [])
+        running = {(ports.norm_bind(t.get("bind")), t["local"])
+                   for t in client.request("status", timeout=2).get("tunnels", [])
                    if t["state"] in ("running", "starting")}
     except (client.DaemonDown, OSError):
         pass
-    from qc import ports
-
     low = config.unprivileged_port_start()
-    for port in sorted({t.local for t in data.tunnels.values() if t.local >= low} - running):
-        if not ports.port_free("127.0.0.1", port):
-            issues.append(config.Issue("warning", f"port {port} is busy now: {ports.owner(port)}"))
+    wanted = {(ports.norm_bind(t.bind), t.local) for t in data.tunnels.values() if t.local >= low}
+    for bind, port in sorted(wanted - running, key=lambda x: (x[1], x[0])):
+        if not ports.port_free(bind, port):
+            issues.append(config.Issue("warning", f"{ports.endpoint(bind, port)} is busy now: "
+                                                  f"{ports.owner(port, bind)}"))
     if not sshgen.include_installed():
         issues.append(config.Issue("warning", "~/.ssh/config has no Include: `qc setup` will add it"))
     for i in issues:

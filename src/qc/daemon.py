@@ -90,6 +90,14 @@ class TunnelState:
         self.log: collections.deque[tuple[float, str]] = collections.deque(maxlen=200)
         self.task: asyncio.Task | None = None
         self.wake = asyncio.Event()
+        # typed passwords, browser-style: kept in memory while the tunnel is on (for reconnects), forgotten on stop
+        self.manual: dict[str, str] = {}      # server (or user@host) → password the user typed
+        self.logins: dict[str, str] = {}      # server → "user@host" for the questions in the menu
+        self.used: set[str] = set()           # typed passwords used in the current connection
+        self.unsaved: set[str] = set()        # typed passwords that worked and wait for "save?"
+        self.ask: dict | None = None          # the menu is asked to type a password: {host, login, failed, …}
+        self.no_answer = False                # the password was not entered (cancelled / no menu open)
+        self.answer: asyncio.Future | None = None
 
     def note(self, line: str) -> None:
         self.log.append((time.time(), line))
@@ -101,7 +109,16 @@ class TunnelState:
             "remote": s.remote, "autostart": s.autostart, "description": s.description,
             "state": self.state, "error": self.error, "since": self.since, "retry_at": self.retry_at,
             "pid": self.proc.pid if self.proc and self.proc.returncode is None else None,
+            "ask": self.ask, "unsaved": bool(self.unsaved),
         }
+
+    def forget(self) -> None:
+        """Typed passwords are not kept after the tunnel is stopped."""
+        self.manual.clear()
+        self.used.clear()
+        self.unsaved.clear()
+        if self.answer and not self.answer.done():
+            self.answer.set_result(None)
 
 
 class Daemon:
@@ -183,6 +200,7 @@ class Daemon:
     def stop(self, st: TunnelState) -> None:
         st.want = False
         st.wake.set()
+        st.forget()
         if st.proc and st.proc.returncode is None:
             st.proc.terminate()
         if not (st.task and not st.task.done()):
@@ -200,34 +218,30 @@ class Daemon:
             return f"no server '{s.via}' in ~/qc/ssh", False
         if s.local < config.unprivileged_port_start():
             return f"port {s.local} cannot be opened without root — use a port above 1024", False
-        need = vault.chain_passwords(self.data, s.via)
-        if need:
-            if not vault.initialized():
-                return "a server on the way logs in with a password, but the password vault is not set up", False
-            missing = [n for n in need if n not in vault.names()]
-            if missing:
-                return f"password '{missing[0]}' is not in the vault — add it in the Passwords tab", False
-            if self.identity is None:
-                return "the password vault is locked — unlock it in the Passwords tab or with qc unlock", True
+        # passwords that are in the vault need it unlocked (unless the user already typed them this time);
+        # passwords that are not saved anywhere are asked in the menu when ssh needs them
+        saved = set(vault.names()) if vault.initialized() else set()
+        locked = [h for h in vault.host_chain(self.data, s.via)
+                  if self.data.hosts[h].password in saved and h not in st.manual]
+        if locked and self.identity is None:
+            return "the password vault is locked — unlock it in the Passwords tab or with qc unlock", True
         for other in self.tunnels.values():
-            if other is not st and other.spec.local == s.local and other.state in ("starting", "running"):
-                return f"port {s.local} is used by tunnel '{other.spec.name}'", False
+            if (other is not st and other.spec.local == s.local and ports.overlap(other.spec.bind, s.bind)
+                    and other.state in ("starting", "running")):
+                return (f"{ports.endpoint(s.bind, s.local)} is used by tunnel '{other.spec.name}' "
+                        f"({ports.endpoint(other.spec.bind, other.spec.local)})"), False
         if not ports.port_free(s.bind, s.local):
-            return f"port {s.local} is in use: {ports.owner(s.local)}", True
+            return f"{ports.endpoint(s.bind, s.local)} is in use: {ports.owner(s.local, s.bind)}", True
         return None
 
     def ssh_command(self, st: TunnelState) -> list[str]:
         s = st.spec
-        # with passwords on the way: no BatchMode (it forbids passwords), the password comes from qc-askpass
-        auth = (["-o", "NumberOfPasswordPrompts=1"] if vault.chain_passwords(self.data, s.via)
-                else ["-o", "BatchMode=yes"])
         return [
             paths.ssh_bin(), *sshgen.config_args(), "-N",
             "-o", "ExitOnForwardFailure=yes",
             "-o", "ServerAliveInterval=30",
             "-o", "ServerAliveCountMax=3",
             "-o", "ConnectTimeout=15",
-            *auth,
             "-o", "ControlMaster=no",
             "-o", "ControlPath=none",
             "-L", f"{s.bind}:{s.local}:{s.remote}",
@@ -270,9 +284,10 @@ class Daemon:
         cmd = self.ssh_command(st)
         st.state, st.since = "starting", time.time()
         st.note("qc: starting " + " ".join(cmd))
-        env = None
-        if vault.chain_passwords(self.data, st.spec.via):
-            env = askpass.env(vault.host_chain(self.data, st.spec.via), secrets.token_hex(8))
+        # every prompt of ssh (and of its jump hosts) goes to qc-askpass → the daemon → the vault or the menu
+        st.used.clear()
+        st.no_answer = False
+        env = askpass.env(vault.host_chain(self.data, st.spec.via), secrets.token_hex(8), st.spec.name)
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL, env=env,
@@ -297,14 +312,17 @@ class Daemon:
                 rc = await asyncio.wait_for(proc.wait(), 0.5)
                 break
             except TimeoutError:
-                if st.state == "starting" and ports.listening(st.spec.local):
+                if st.state == "starting" and ports.listening(st.spec.local, st.spec.bind):
                     st.state, st.error, st.since = "running", "", time.time()
                     st.note("qc: tunnel is up")
-                    log(f"{st.spec.name}: up (port {st.spec.local})")
+                    st.unsaved |= {k for k in st.used if k in st.manual}  # typed and worked — offer to save
+                    log(f"{st.spec.name}: up ({ports.endpoint(st.spec.bind, st.spec.local)})")
         await asyncio.gather(reader, return_exceptions=True)
         st.note(f"qc: ssh exited with code {rc}")
         if not st.want:
             return None
+        if st.no_answer:
+            return "a password is needed — start the tunnel from the menu (or qc t up) and type it", False
         return classify(st.log, rc, st.spec.via)
 
     # ---------- password vault ----------
@@ -336,23 +354,97 @@ class Daemon:
         except vault.VaultError as e:
             return {"ok": False, "error": str(e)}
 
-    def answer_askpass(self, prompt: str, chain: list[str], token: str) -> dict:
+    async def answer_askpass(self, prompt: str, chain: list[str], token: str, tunnel: str = "") -> dict:
         if self.scan_mtime() != self.mtime:
             self.reload()
-        host = vault.match_host(self.data, prompt, chain)
-        if host is None:
-            return {"ok": False, "error": f"no server with a saved password for the prompt {prompt.strip()!r}"}
+        low = prompt.lower()
+        if "continue connecting" in low or "passphrase" in low:
+            return {"ok": False, "error": "host key questions and key passphrases are not answered"}
+        st = self.tunnels.get(tunnel) if tunnel else None
+        parsed = vault.parse_prompt(prompt)
+        host = vault.match_host(self.data, prompt, chain, any_host=st is not None) if parsed else None
+        login = f"{parsed[0]}@{parsed[1]}" if parsed and parsed[0] and parsed[1] else prompt.strip()
+        key = host or login
         now = time.time()
         self.asked = {t: v for t, v in self.asked.items() if now - v[0] < 3600}
+        times = 0
         if token:
-            _, done = self.asked.setdefault(token, (now, set()))
-            if host in done:  # the password was rejected: do not repeat it (fail2ban)
-                return {"ok": False, "error": f"the saved password for '{host}' was rejected — not trying again"}
-            done.add(host)
-        r = self.secret(self.data.hosts[host].password)
-        if r.get("locked"):
-            r["error"] = "the password vault is locked — unlock it in the Passwords tab or with qc unlock"
-        return r
+            _, done = self.asked.setdefault(token, (now, {}))
+            times = done.get(key, 0)
+            done[key] = times + 1
+        entry = self.data.hosts[host].password if host else None
+
+        if st is None:  # qc ssh: only the vault, and a saved password is never sent twice (fail2ban)
+            if times:
+                return {"ok": False, "error": f"the saved password for '{key}' was rejected — not trying again"}
+            if not entry:
+                return {"ok": False, "error": f"no server with a saved password for the prompt {prompt.strip()!r}"}
+            r = self.secret(entry)
+            if r.get("locked"):
+                r["error"] = "the password vault is locked — unlock it in the Passwords tab or with qc unlock"
+            return r
+
+        if parsed is None:  # a one-time code and the like: ask the user, never keep it
+            secret = await self.ask_user(st, key, prompt.strip(), failed=times > 0, entry=None)
+            return {"ok": True, "secret": secret} if secret is not None else \
+                {"ok": False, "error": "nothing was entered"}
+
+        st.logins[key] = login
+        if times == 0:
+            if key in st.manual:  # typed earlier for this tunnel (reconnect)
+                st.used.add(key)
+                return {"ok": True, "secret": st.manual[key]}
+            if entry and vault.initialized() and entry in vault.names() and self.identity is not None:
+                r = self.secret(entry)
+                if r.get("ok"):
+                    return r
+        else:
+            st.manual.pop(key, None)  # the previous answer (saved or typed) was wrong — the saved one is not resent
+        if times >= 99:
+            return {"ok": False, "error": "nothing was entered"}
+        if times >= 3:
+            return {"ok": False, "error": f"3 wrong passwords for {login} — stopped (fail2ban)"}
+        secret = await self.ask_user(st, key, login, failed=times > 0, entry=entry or host)
+        if secret is None:
+            if token:
+                self.asked[token][1][key] = 99  # cancelled — do not ask again in this connection
+            st.no_answer = True
+            return {"ok": False, "error": "nothing was entered"}
+        st.manual[key] = secret
+        st.used.add(key)
+        return {"ok": True, "secret": secret}
+
+    async def ask_user(self, st: TunnelState, key: str, login: str, failed: bool, entry: str | None) -> str | None:
+        """Wait (up to ~100 s, the server gives about 120) until the menu or `qc t up` types the password."""
+        st.answer = asyncio.get_running_loop().create_future()
+        st.ask = {"host": key, "login": login, "failed": failed, "entry": entry,
+                  "server": key if key in self.data.hosts else None, "since": time.time()}
+        prev, st.state = st.state, "password"
+        st.note(f"qc: waiting for the password for {login}" + (" (the previous one was wrong)" if failed else ""))
+        log(f"{st.spec.name}: waiting for the password for {login}")
+        try:
+            return await asyncio.wait_for(st.answer, 100)
+        except TimeoutError:
+            st.note("qc: no password was entered in time")
+            return None
+        finally:
+            st.ask, st.answer = None, None
+            if st.state == "password":
+                st.state = prev if prev != "password" else "starting"
+
+    def take_unsaved(self, st: TunnelState) -> list[dict]:
+        """Typed passwords that worked: for the "save it?" question. Asked once."""
+        saved = set(vault.names()) if vault.initialized() else set()
+        out = []
+        for key in sorted(st.unsaved):
+            if key not in st.manual:
+                continue
+            server = key if key in self.data.hosts else None
+            entry = (self.data.hosts[server].password or server) if server else None
+            out.append({"host": key, "server": server, "login": st.logins.get(key, key), "entry": entry,
+                        "update": bool(entry and entry in saved), "secret": st.manual[key]})
+        st.unsaved.clear()
+        return out
 
     # ---------- socket commands ----------
 
@@ -402,8 +494,18 @@ class Daemon:
         if cmd == "secret":
             return self.secret(str(req.get("name", "")))
         if cmd == "askpass":
-            return self.answer_askpass(str(req.get("prompt", "")), list(req.get("chain") or []),
-                                       str(req.get("token", "")))
+            return await self.answer_askpass(str(req.get("prompt", "")), list(req.get("chain") or []),
+                                             str(req.get("token", "")), str(req.get("tunnel", "")))
+        if cmd in ("password", "take_unsaved"):
+            st = self.tunnels.get(str(req.get("tunnel", "")))
+            if not st:
+                return {"ok": False, "error": "no such tunnel"}
+            if cmd == "take_unsaved":
+                return {"ok": True, "items": self.take_unsaved(st)}
+            if not (st.answer and not st.answer.done()):
+                return {"ok": False, "error": "the tunnel is not waiting for a password"}
+            st.answer.set_result(None if req.get("cancel") else str(req.get("secret", "")))
+            return {"ok": True}
         if cmd in ("up", "down", "restart"):
             if self.scan_mtime() != self.mtime:
                 self.reload()

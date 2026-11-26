@@ -179,17 +179,18 @@ def parse_prompt(prompt: str) -> tuple[str | None, str | None] | None:
     return user, host
 
 
-def match_host(data, prompt: str, chain: list[str]) -> str | None:
+def match_host(data, prompt: str, chain: list[str], any_host: bool = False) -> str | None:
     """Which server from ~/qc/ssh the prompt is about. The tunnel/connection chain goes first,
-    so two servers with the same address but different passwords do not get mixed up."""
+    so two servers with the same address but different passwords do not get mixed up.
+    any_host — also servers without a saved password (a tunnel asks the user for those)."""
     parsed = parse_prompt(prompt)
     if parsed is None:
         return None
     user, host = parsed
     pool = [n for n in chain if n in data.hosts] + [n for n in data.hosts if n not in chain]
-    with_pw = [n for n in pool if data.hosts[n].password]
+    with_pw = [n for n in pool if any_host or data.hosts[n].password]
     if host is None:
-        in_chain = [n for n in chain if n in data.hosts and data.hosts[n].password]
+        in_chain = [n for n in chain if n in data.hosts and (any_host or data.hosts[n].password)]
         return in_chain[0] if len(in_chain) == 1 else None
     for name in with_pw:
         h = data.hosts[name]
