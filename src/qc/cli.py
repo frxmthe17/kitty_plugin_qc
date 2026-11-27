@@ -201,7 +201,9 @@ def print_tunnels(resp: dict) -> None:
         elif t["state"] == "error":
             state = t["error"]
         auto = " [auto]" if t["autostart"] else ""
-        print(f"{ICON.get(t['state'], '?')} {t['name']:<{w}}  {ports.short(t.get('bind'), t['local']):>5} → {t['via']}:{t['remote']}"
+        where = f"{'—':>5}   {t['via']} (kept open)" if not t["local"] else \
+            f"{ports.short(t.get('bind'), t['local']):>5} → {t['via']}:{t['remote']}"
+        print(f"{ICON.get(t['state'], '?')} {t['name']:<{w}}  {where}"
               f"  {state}{auto}")
     for i in resp.get("issues", []):
         if i["level"] == "warning" or re.search(r"\b(tunnel|port)\b", i["text"]):

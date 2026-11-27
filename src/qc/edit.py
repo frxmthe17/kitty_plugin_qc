@@ -28,16 +28,18 @@ local = 15432             # port on this computer
 # bind = "127.0.0.2"      # local address, 127.0.0.1 by default: the same port can run on 127.0.0.2,
                           # 127.0.0.3… at once; 0.0.0.0 opens it to the whole network
 remote = "127.0.0.1:5432" # where to connect on the remote side
+                          # no local and remote: just keep the connection to via open in the background —
+                          # ssh, scp and jumps through it then reuse it (no new login, no password)
 autostart = false
 description = ""
 '''),
-    "cmd": ("commands", "commands", '''
-[commands.{name}]
-title = ""
+    # one file = one command, the file name is the command name: no table header
+    "cmd": ("commands", "", '''title = ""
 run = ""                  # {{{{name}}}} asks for a value when chosen
 tags = []
 '''),
 }
+ONE_PER_FILE = ("cmd",)
 NEW_NAME = {"ssh": "new-server", "tun": "new-tunnel", "cmd": "new-command"}
 TOML_LINE_RE = re.compile(r"at line (\d+)")
 
@@ -87,6 +89,8 @@ def locate(data: config.Data, tab: str, name: str) -> tuple[Path, int | None]:
     if obj is None:
         raise EditError(f"no '{name}'")
     path = paths.data_dir() / obj.file
+    if tab in ONE_PER_FILE:
+        return path, None
     return path, entry_line(path, SECTIONS[tab][1], name)
 
 
@@ -157,9 +161,29 @@ class Draft:
         return True
 
 
+def new_command(data: config.Data, cwd: str, name: str) -> Draft:
+    """A new command is a new file: commands/<menu folder>/<name>.toml."""
+    sub, _, template = SECTIONS["cmd"]
+    name = name.strip().removesuffix(".toml")
+    if not config.NAME_RE.match(name):
+        raise EditError(f"name '{name}': only Latin letters, digits, . _ -")
+    if name in data.commands:
+        raise EditError(f"command '{name}' already exists in {data.commands[name].file}")
+    folder = config.norm_dir(cwd)
+    path = paths.data_dir() / sub / folder / f"{name}.toml" if folder else paths.data_dir() / sub / f"{name}.toml"
+    if path.exists():
+        raise EditError(f"{path} already exists")
+    text = template.format(name=name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return Draft(path=path, line=1, name=name, original=None, written=text)
+
+
 def new_entry(data: config.Data, tab: str, cwd: str, new_file: str | None = None) -> Draft:
     """Append an entry template to the current folder's file (or create the file new_file in the section)."""
     sub, _, template = SECTIONS[tab]
+    if tab in ONE_PER_FILE:
+        raise EditError("one file per entry: use new_command")
     if new_file:
         rel = new_file.strip().strip("/")
         if "/" in rel or rel.startswith("."):

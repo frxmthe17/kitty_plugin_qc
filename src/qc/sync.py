@@ -26,7 +26,8 @@ subfolders work too: `ssh/prod/eu.toml` → folder `prod/eu`. Entry names are sh
 - `ssh/*.toml` — servers. They are compiled into `.generated/ssh_config` (included from `~/.ssh/config`),
   so `ssh <name>`, `scp`, `rsync` work without the menu too.
 - `tunnels/*.toml` — tunnels, kept up in the background by the `qcd` daemon.
-- `commands/*.toml` — commands. `{{name}}` — ask for the value when the command is picked.
+- `commands/<folder>/<name>.toml` — commands, one file = one command: the file name is the command name,
+  the folder is the menu folder. `{{name}}` — ask for the value when the command is picked.
 - `secure/` — passwords, each in its own encrypted file.
 
 ```toml
@@ -55,8 +56,11 @@ local = 15432             # port on this computer
 remote = "127.0.0.1:5432" # where to on the other side
 autostart = false         # bring up at login
 
-# commands/example.toml
-[commands.pg-activity]
+[tunnels.bastion-open]
+via = "bastion"           # only via: keep the connection open in the background, no ports;
+                          # ssh / scp / ProxyJump through "bastion" reuse it without a new login
+
+# commands/example/pg-activity.toml — one command, no [commands.…] header
 title = "Active queries"
 run = "psql -h 127.0.0.1 -p {{port}} -U {{user}} -c 'select pid, state, query from pg_stat_activity'"
 tags = ["pg"]

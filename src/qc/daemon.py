@@ -77,6 +77,26 @@ def timeout_hours() -> float:
         return 8.0
 
 
+def locked_ok(d: "Daemon", st: "TunnelState") -> bool:
+    """Passwords that are in the vault need it unlocked (unless the user already typed them this time);
+    passwords that are not saved anywhere are asked in the menu when ssh needs them."""
+    saved = set(vault.names()) if vault.initialized() else set()
+    locked = [h for h in vault.host_chain(d.data, st.spec.via)
+              if d.data.hosts[h].password in saved and h not in st.manual]
+    return not (locked and d.identity is None)
+
+
+def route(spec: config.Tunnel) -> str:
+    return f"{spec.via} kept open" if spec.keep_open else ports.endpoint(spec.bind, spec.local)
+
+
+def is_up(spec: config.Tunnel) -> bool:
+    """Port tunnel: the local port listens. Kept-open connection: the ssh master socket is there."""
+    if spec.keep_open:
+        return paths.control_path(spec.via).is_socket()
+    return ports.listening(spec.local, spec.bind)
+
+
 class TunnelState:
     def __init__(self, spec: config.Tunnel, host_key: tuple):
         self.spec = spec
@@ -216,14 +236,17 @@ class Daemon:
         s = st.spec
         if s.via not in self.data.hosts:
             return f"no server '{s.via}' in ~/qc/ssh", False
+        if s.keep_open:
+            if not locked_ok(self, st):
+                return "the password vault is locked — unlock it in the Passwords tab or with qc unlock", True
+            for other in self.tunnels.values():
+                if other is not st and other.spec.keep_open and other.spec.via == s.via \
+                        and other.state in ("starting", "running"):
+                    return f"'{s.via}' is already kept open by '{other.spec.name}'", False
+            return None
         if s.local < config.unprivileged_port_start():
             return f"port {s.local} cannot be opened without root — use a port above 1024", False
-        # passwords that are in the vault need it unlocked (unless the user already typed them this time);
-        # passwords that are not saved anywhere are asked in the menu when ssh needs them
-        saved = set(vault.names()) if vault.initialized() else set()
-        locked = [h for h in vault.host_chain(self.data, s.via)
-                  if self.data.hosts[h].password in saved and h not in st.manual]
-        if locked and self.identity is None:
+        if not locked_ok(self, st):
             return "the password vault is locked — unlock it in the Passwords tab or with qc unlock", True
         for other in self.tunnels.values():
             if (other is not st and other.spec.local == s.local and ports.overlap(other.spec.bind, s.bind)
@@ -236,6 +259,17 @@ class Daemon:
 
     def ssh_command(self, st: TunnelState) -> list[str]:
         s = st.spec
+        if s.keep_open:
+            return [
+                paths.ssh_bin(), *sshgen.config_args(), "-N",
+                "-o", "ServerAliveInterval=30",
+                "-o", "ServerAliveCountMax=3",
+                "-o", "ConnectTimeout=15",
+                "-o", "ControlMaster=yes",
+                "-o", "ControlPersist=no",
+                "-o", f"ControlPath={paths.control_path(s.via)}",
+                s.via,
+            ]
         return [
             paths.ssh_bin(), *sshgen.config_args(), "-N",
             "-o", "ExitOnForwardFailure=yes",
@@ -282,6 +316,11 @@ class Daemon:
 
     async def run_once(self, st: TunnelState) -> tuple[str, bool] | None:
         cmd = self.ssh_command(st)
+        if st.spec.keep_open:
+            cp = paths.control_path(st.spec.via)
+            cp.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if cp.is_socket():
+                cp.unlink()  # left from a killed ssh: with it in place ssh would refuse to become the master
         st.state, st.since = "starting", time.time()
         st.note("qc: starting " + " ".join(cmd))
         # every prompt of ssh (and of its jump hosts) goes to qc-askpass → the daemon → the vault or the menu
@@ -312,11 +351,11 @@ class Daemon:
                 rc = await asyncio.wait_for(proc.wait(), 0.5)
                 break
             except TimeoutError:
-                if st.state == "starting" and ports.listening(st.spec.local, st.spec.bind):
+                if st.state == "starting" and is_up(st.spec):
                     st.state, st.error, st.since = "running", "", time.time()
                     st.note("qc: tunnel is up")
                     st.unsaved |= {k for k in st.used if k in st.manual}  # typed and worked — offer to save
-                    log(f"{st.spec.name}: up ({ports.endpoint(st.spec.bind, st.spec.local)})")
+                    log(f"{st.spec.name}: up ({route(st.spec)})")
         await asyncio.gather(reader, return_exceptions=True)
         st.note(f"qc: ssh exited with code {rc}")
         if not st.want:

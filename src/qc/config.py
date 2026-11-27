@@ -46,6 +46,11 @@ class Tunnel:
     group: str = ""
     file: str = ""
 
+    @property
+    def keep_open(self) -> bool:
+        """No ports: the tunnel just keeps an ssh connection to `via` open; ssh, scp and jumps through it reuse it."""
+        return not self.local
+
     def spec_key(self) -> tuple:
         """What affects the running ssh: when it changes, the tunnel is restarted."""
         return (self.via, self.local, self.remote, self.bind)
@@ -172,12 +177,16 @@ def load(base: Path | None = None) -> Data:
         for name, t in (doc.get("tunnels") or {}).items():
             if not isinstance(t, dict):
                 continue
-            remote = _parse_remote(t.get("remote"))
-            local = t.get("local")
-            if not t.get("via") or not isinstance(local, int) or remote is None:
-                data.issues.append(Issue(
-                    "error", f"{rel}: tunnel '{name}' needs via, local (number) and remote (\"host:port\")"))
-                continue
+            local, raw_remote = t.get("local"), t.get("remote")
+            if t.get("via") and local is None and raw_remote is None:
+                local, remote = 0, ""  # only via: keep the connection open (an ssh master), no ports
+            else:
+                remote = _parse_remote(raw_remote)
+                if not t.get("via") or not isinstance(local, int) or remote is None:
+                    data.issues.append(Issue(
+                        "error", f"{rel}: tunnel '{name}' needs via, local (number) and remote (\"host:port\") "
+                                 "— or only via, to keep the connection open"))
+                    continue
             obj = Tunnel(
                 name=name, via=t["via"], local=local, remote=remote,
                 bind=t.get("bind", "127.0.0.1"), autostart=bool(t.get("autostart", False)),
@@ -185,21 +194,26 @@ def load(base: Path | None = None) -> Data:
             )
             add("tunnel", data.tunnels, name, obj, rel)
 
+    # one file = one command: commands/<folder…>/<name>.toml, the menu folder is the real folder
     for path in _files(base, "commands"):
         doc = read(path)
         if doc is None:
             continue
-        rel, group = str(path.relative_to(base)), group_path(base, "commands", path, doc)
-        for name, c in (doc.get("commands") or {}).items():
-            if not isinstance(c, dict) or not c.get("run"):
-                data.issues.append(Issue("error", f"{rel}: command '{name}' has no run field"))
-                continue
-            obj = Command(
-                name=name, run=c["run"].strip(), title=c.get("title", ""),
-                tags=list(c.get("tags") or []), description=c.get("description", ""),
-                group=group, file=rel,
-            )
-            add("command", data.commands, name, obj, rel)
+        rel = str(path.relative_to(base))
+        if isinstance(doc.get("commands"), dict):
+            data.issues.append(Issue("error", f"{rel}: old format — one file holds one command now: "
+                                              f"move each [commands.<name>] to commands/<folder>/<name>.toml"))
+            continue
+        c = doc
+        if not isinstance(c.get("run"), str) or not c["run"].strip():
+            data.issues.append(Issue("error", f"{rel}: no run field"))
+            continue
+        obj = Command(
+            name=path.stem, run=c["run"].strip(), title=c.get("title", ""),
+            tags=list(c.get("tags") or []), description=c.get("description", ""),
+            group=norm_dir("/".join(path.relative_to(base / "commands").parts[:-1])), file=rel,
+        )
+        add("command", data.commands, path.stem, obj, rel)
 
     return data
 
@@ -248,6 +262,8 @@ def check(data: Data) -> list[Issue]:
                                          "(127.0.0.1, 127.0.0.2, 0.0.0.0…)"))
         if t.via not in data.hosts:
             issues.append(Issue("error", f"tunnel '{t.name}': via '{t.via}': no such server"))
+        if t.keep_open:
+            continue
         if not (0 < t.local < 65536):
             issues.append(Issue("error", f"tunnel '{t.name}': port {t.local} out of range"))
         elif t.local < low:

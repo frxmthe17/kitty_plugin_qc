@@ -37,3 +37,8 @@ def generated_ssh_config() -> Path:
 
 def ssh_bin() -> str:
     return os.environ.get("QC_SSH") or "ssh"
+
+
+def control_path(host: str) -> Path:
+    """ssh master socket of a kept-open connection (a tunnel with only `via`); ssh_config points the host to it."""
+    return runtime_dir() / "qc-cm" / host

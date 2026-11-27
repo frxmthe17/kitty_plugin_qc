@@ -11,7 +11,11 @@ search looks in the current folder and below.
 - `Ctrl+E` — edit in vim (an entry — cursor on its line; a folder — its files), `Ctrl+N` — new entry in the folder.
   After you exit, the file is checked: on an error it offers to reopen the file at that line; if all is well —
   a commit in `~/qc`. Editor: `qc config edit.editor <command>`, otherwise `$VISUAL`/`$EDITOR`/vim.
+- Commands: one file = one command — `commands/<folder>/<name>.toml` (`title`, `run`, `tags`, `description`).
+  `Ctrl+N` asks for the name and creates the file in the current folder.
 - Tunnels: `Ctrl+U` — start, `Ctrl+D` — stop (the tunnel under the cursor or the whole folder), Enter — toggle.
+  A tunnel with only `via` (no `local`/`remote`) keeps that server's connection open in the background:
+  `ssh`, `scp` and jumps through it reuse it (an ssh master socket), so there is no new login or password prompt.
 
 ## Installation
 ```

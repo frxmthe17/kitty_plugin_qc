@@ -348,7 +348,8 @@ class QcApp(App[tuple | None]):
             else:
                 state = "stopped" + (" (autostart)" if t["autostart"] else "")
             rows.append((t["name"], (Text(icon, style=color), Text(self.rel_name("tun", x), style="bold"),
-                                     ports.short(t.get("bind"), t["local"]), f"{t['via']} → {t['remote']}",
+                                     *((Text("—", style="dim"), f"{t['via']} (kept open)") if not t["local"] else
+                                       (ports.short(t.get("bind"), t["local"]), f"{t['via']} → {t['remote']}")),
                                      Text(state, style=color))))
         self.set_path("tun")
         self.fill("tun", rows)
@@ -1049,6 +1050,21 @@ class QcApp(App[tuple | None]):
         if tab not in TREE_TABS:
             return
         cwd = self.cwd[tab]
+        if tab in edit.ONE_PER_FILE:
+            # one file = one command: the name is the file name, so ask for it first
+            def named(name: str | None) -> None:
+                if not name or not name.strip():
+                    return
+                try:
+                    d = edit.new_command(self.data, cwd, name)
+                except edit.EditError as e:
+                    self.notify(str(e), severity="error")
+                    return
+                self.open_editor([d.path], d.line, d.name, draft=d)
+
+            self.push_screen(AskScreen(f"New command in ~/qc/commands/{cwd + '/' if cwd else ''}",
+                                       edit.unique_name(self.data, tab), "command name (Latin letters, . _ -)"), named)
+            return
         try:
             draft = edit.new_entry(self.data, tab, cwd)
         except edit.EditError:
